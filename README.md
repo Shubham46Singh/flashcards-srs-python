@@ -232,6 +232,8 @@ This allows the student to review difficult cards again without waiting until th
 
 The distinction between the daily study schedule and same-session practice is important: repeating a failed card should support learning without incorrectly treating the repeat as an entirely new study day.
 
+When a flashcard is answered more than once within the same study day, the application records the new answer but does not advance its repetitions or review interval again. Only the ease factor is adjusted based on the new grade. This prevents multiple answers within one sitting from artificially increasing the long-term review interval. A failed card is returned to the end of the current Redis queue on its first answer of the day, allowing additional practice without treating it as a new study day.
+
 ### Design Decision
 
 Using a 04:00 study-day boundary and a Redis queue keyed by study day makes the system more consistent for students who study late at night.
