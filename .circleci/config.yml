@@ -1,0 +1,125 @@
+
+version: 2.1
+
+jobs:
+  lint:
+    docker:
+      - image: cimg/python:3.12
+    steps:
+      - checkout
+      - run:
+          name: Install Ruff
+          command: pip install ruff
+      - run:
+          name: Check Python code
+          command: ruff check app tests
+
+  unit_tests:
+    docker:
+      - image: cimg/python:3.12
+    steps:
+      - checkout
+      - run:
+          name: Install test dependencies
+          command: pip install pytest pytest-cov
+      - run:
+          name: Run unit tests
+          command: python -m pytest tests/test_schedule.py --cov=app.schedule --cov-report=term-missing
+
+  integration_tests:
+    docker:
+      - image: cimg/python:3.12
+        environment:
+          DATABASE_URL: postgresql://flashcards:flashcards@localhost:5432/flashcards
+          REDIS_URL: redis://localhost:6379/0
+      - image: postgres:16-alpine
+        environment:
+          POSTGRES_USER: flashcards
+          POSTGRES_PASSWORD: flashcards
+          POSTGRES_DB: flashcards
+      - image: redis:7-alpine
+    steps:
+      - checkout
+      - run:
+          name: Install dependencies
+          command: |
+            pip install -r requirements.txt
+            pip install pytest pytest-cov httpx
+      - run:
+          name: Wait for PostgreSQL
+          command: |
+            python - <<'PY'
+            import time
+            import psycopg
+
+            for attempt in range(30):
+                try:
+                    with psycopg.connect(
+                        "postgresql://flashcards:flashcards@localhost:5432/flashcards"
+                    ) as conn:
+                        print("PostgreSQL is ready")
+                        break
+                except psycopg.OperationalError:
+                    time.sleep(2)
+            else:
+                raise SystemExit("PostgreSQL did not start")
+            PY
+      - run:
+          name: Apply migrations
+          command: |
+            python - <<'PY'
+            import glob
+            import psycopg
+
+            with psycopg.connect(
+                "postgresql://flashcards:flashcards@localhost:5432/flashcards"
+            ) as conn:
+                for path in sorted(glob.glob("migrations/*.sql")):
+                    print("Applying", path)
+                    with conn.cursor() as cursor:
+                        cursor.execute(open(path, encoding="utf-8").read())
+                    conn.commit()
+            PY
+      - run:
+          name: Run integration tests
+          command: python -m pytest tests/test_integration.py --cov=app --cov-report=term-missing --cov-fail-under=70
+
+  secret_scan:
+    docker:
+      - image: cimg/python:3.12
+    steps:
+      - checkout
+      - run:
+          name: Install Gitleaks
+          command: |
+            curl -sSfL https://raw.githubusercontent.com/gitleaks/gitleaks/master/install.sh | sh -s -- -b /usr/local/bin
+      - run:
+          name: Scan repository
+          command: gitleaks git --redact --exit-code 1
+
+  image_build:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Build Docker image
+          command: docker build -t flashcards-srs:1.0 .
+
+workflows:
+  build_test_ship:
+    jobs:
+      - lint
+      - unit_tests:
+          requires:
+            - lint
+      - integration_tests:
+          requires:
+            - unit_tests
+      - secret_scan:
+          requires:
+            - integration_tests
+      - image_build:
+          requires:
+            - secret_scan
