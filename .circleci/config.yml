@@ -1,0 +1,217 @@
+
+version: 2.1
+
+jobs:
+  secret_scan:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
+      - run:
+          name: Install Gitleaks
+          command: |
+            GITLEAKS_VERSION=8.24.3
+            curl -fsSL \
+              "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+              -o /tmp/gitleaks.tar.gz
+            mkdir -p /tmp/gitleaks-bin
+            tar -xzf /tmp/gitleaks.tar.gz -C /tmp/gitleaks-bin gitleaks
+            /tmp/gitleaks-bin/gitleaks version
+
+      - run:
+          name: Scan repository for secrets
+          command: |
+            /tmp/gitleaks-bin/gitleaks git . --redact --exit-code 1
+
+  lint:
+    docker:
+      - image: cimg/python:3.12
+    steps:
+      - checkout
+      - run:
+          name: Install Ruff
+          command: pip install ruff
+      - run:
+          name: Check Python code
+          command: ruff check app tests
+
+  unit_tests:
+    docker:
+      - image: cimg/python:3.12
+    steps:
+      - checkout
+      - run:
+          name: Install test dependencies
+          command: pip install pytest pytest-cov
+      - run:
+          name: Run unit tests
+          command: |
+            python -m pytest tests/test_schedule.py \
+              --cov=app.schedule \
+              --cov-report=term-missing
+
+  integration_tests:
+    docker:
+      - image: cimg/python:3.12
+        environment:
+          DATABASE_URL: postgresql://flashcards:flashcards@localhost:5432/flashcards
+          REDIS_URL: redis://localhost:6379/0
+      - image: postgres:16-alpine
+        environment:
+          POSTGRES_USER: flashcards
+          POSTGRES_PASSWORD: flashcards
+          POSTGRES_DB: flashcards
+      - image: redis:7-alpine
+
+    steps:
+      - checkout
+
+      - run:
+          name: Install dependencies
+          command: |
+            pip install -r requirements.txt
+            pip install pytest pytest-cov httpx
+
+      - run:
+          name: Wait for PostgreSQL and Redis
+          command: |
+            python -c '
+            import time
+            import psycopg
+            import redis
+
+            database_url = "postgresql://flashcards:flashcards@localhost:5432/flashcards"
+
+            for attempt in range(30):
+                try:
+                    with psycopg.connect(database_url) as conn:
+                        conn.execute("SELECT 1")
+                    redis.Redis(host="localhost", port=6379).ping()
+                    print("PostgreSQL and Redis are ready")
+                    break
+                except (psycopg.OperationalError, redis.RedisError):
+                    print("Waiting for services...")
+                    time.sleep(2)
+            else:
+                raise SystemExit("Services did not become ready")
+            '
+
+      - run:
+          name: Apply database migrations
+          command: |
+            python -c '
+            import glob
+            import psycopg
+
+            database_url = "postgresql://flashcards:flashcards@localhost:5432/flashcards"
+
+            with psycopg.connect(database_url) as conn:
+                for path in sorted(glob.glob("migrations/*.sql")):
+                    print("Applying migration:", path)
+                    with open(path, encoding="utf-8") as file:
+                        sql = file.read()
+                    with conn.cursor() as cursor:
+                        cursor.execute(sql)
+                    conn.commit()
+
+            print("All migrations completed")
+            '
+
+      - run:
+          name: Run integration tests
+          command: |
+            python -m pytest tests/test_integration.py \
+              --cov=app \
+              --cov-report=term-missing \
+              --cov-fail-under=70
+
+  publish_image:
+    parameters:
+      tag:
+        type: string
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
+      - setup_remote_docker
+
+      - run:
+          name: Build and publish Docker image
+          command: |
+            set -e
+
+            : "${DOCKERHUB_USER:?Missing DOCKERHUB_USER}"
+            : "${DOCKERHUB_TOKEN:?Missing DOCKERHUB_TOKEN}"
+
+            TAG="<< parameters.tag >>"
+            SHORT_SHA=$(echo "$CIRCLE_SHA1" | cut -c1-7)
+            IMAGE="$DOCKERHUB_USER/flashcards-srs"
+
+            echo "$DOCKERHUB_TOKEN" | docker login \
+              -u "$DOCKERHUB_USER" \
+              --password-stdin
+
+            docker build \
+              -t "$IMAGE:$TAG" \
+              -t "$IMAGE:$TAG-$SHORT_SHA" .
+
+            docker push "$IMAGE:$TAG"
+            docker push "$IMAGE:$TAG-$SHORT_SHA"
+
+            docker logout
+
+workflows:
+  qa_pipeline:
+    jobs:
+      - secret_scan:
+          filters:
+            branches:
+              only: main
+
+      - lint:
+          requires:
+            - secret_scan
+          filters:
+            branches:
+              only: main
+
+      - unit_tests:
+          requires:
+            - lint
+          filters:
+            branches:
+              only: main
+
+      - integration_tests:
+          requires:
+            - unit_tests
+          filters:
+            branches:
+              only: main
+
+      - publish_image:
+          name: publish_qa
+          tag: qa
+          requires:
+            - integration_tests
+          filters:
+            branches:
+              only: main
+
+  staging_pipeline:
+    jobs:
+      - publish_image:
+          name: publish_stage
+          tag: stage
+          filters:
+            branches:
+              only: staging
+
+  production_pipeline:
+    jobs:
+      - publish_image:
+          name: publish_prod
+          tag: prod
+          filters:
+            branches:
+              only: prod
